@@ -1,0 +1,12 @@
+.DS_Store
+__pycache__
+data/*.bin
+data/vocab
+data/train-*.json
+data/dev-*.json
+log/checkpoint
+log/events.*
+log/*.pbtxt
+log/*.ckpt*
+log/train/*
+log/eval/*
