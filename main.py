@@ -79,54 +79,33 @@ def _train(model, data_batcher):
         allow_soft_placement=True))
     running_avg_loss = 0
     step = 0
-    batch_size = model._params.batch_size
-    nwords = model._params.c_timesteps
-    # position estimates; start from the beginning and the end
-    no_change = np.zeros(shape=(2, batch_size))
-    no_change[0, :] = 0
-    no_change[1, :] = nwords-1
     while not sv.should_stop() and step < FLAGS.max_run_steps:
 
       (batch_context, batch_question, batch_answer,
        _, _, _) = data_batcher.next()
 
-      pos = no_change
+      initial_guess = np.zeros((2, model._params.batch_size))
 
-      for i in range(model._params.max_decode_steps):
-        start = time.time()
+      start = time.time()
+      (_, summaries, loss, train_step, s, e) = model.train(
+          sess, batch_context, batch_question, batch_answer, initial_guess)
 
-        (_, summaries, loss, train_step, s, e) = model.train(
-            sess, batch_context, batch_question, batch_answer, pos)
+      tf.logging.info('took: %.4f sec', time.time()-start)
+      tf.logging.info('global_step: %d', train_step)
+      tf.logging.info('loss: %f', loss)
+      tf.logging.info('running_avg_loss: %f', running_avg_loss)
 
-        summary_writer.add_summary(summaries, train_step)
-        running_avg_loss = _runningAvgLoss(
-            running_avg_loss, loss, summary_writer, train_step)
+      pred_answers = np.hstack((s, e))
+      tf.logging.info('pred_answers: {}'.format(pred_answers))
+      tf.logging.info('true_answers: {}\n'.format(batch_answer))
 
-        tf.logging.info('took: %.4f sec', time.time()-start)
-        tf.logging.info('global_step: %d', train_step)
-        tf.logging.info('decode_step_%d_loss: %f' % (i, loss))
-        tf.logging.info('running_avg_loss: %f', running_avg_loss)
+      summary_writer.add_summary(summaries, train_step)
+      running_avg_loss = _runningAvgLoss(
+          running_avg_loss, loss, summary_writer, train_step)
 
-        step += 1
-        if step % 100 == 0:
-          summary_writer.flush()
-
-        # concat
-        new_pos = np.vstack((s, e))
-
-        tf.logging.info('old_answers: {}'.format(pos))
-        tf.logging.info('new_answers: {}'.format(new_pos))
-        tf.logging.info('true_answers: {}\n'.format(batch_answer))
-
-        # exit criterion
-        if i < model._params.max_decode_steps-1 \
-            and np.array_equal(pos, new_pos) \
-            and not np.array_equal(no_change, new_pos):
-          tf.logging.info('decode_step_%d_early_stopping...\n' % i)
-          break
-
-        # update position estimates
-        pos = new_pos
+      step += 1
+      if step % 100 == 0:
+        summary_writer.flush()
 
     sv.Stop()
     return running_avg_loss
@@ -139,8 +118,6 @@ def _eval(model, data_batcher):
   sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True))
   running_avg_loss = 0
   step = 0
-  batch_size = model._params.batch_size
-  nwords = model._params.c_timesteps
   while True:
     time.sleep(FLAGS.eval_interval_secs)
     try:
@@ -158,14 +135,12 @@ def _eval(model, data_batcher):
 
     (batch_context, batch_question, batch_answer,
      origin_context, origin_question, origin_answer) = data_batcher.next()
-    # position estimates; start from the beginning and the end
-    pos = np.zeros(shape=(2, batch_size))
-    pos[0, :] = 0
-    pos[1, :] = nwords-1
+
+    initial_guess = np.zeros((2, model._params.batch_size))
 
     start = time.time()
     (summaries, loss, train_step) = model.eval(
-        sess, batch_context, batch_question, batch_answer, pos)
+        sess, batch_context, batch_question, batch_answer, initial_guess)
 
     tf.logging.info('took: %.4f sec', time.time()-start)
     tf.logging.info('context:  %s', origin_context)
@@ -198,12 +173,12 @@ def main(unused_argv):
       mode=FLAGS.mode,  # train, eval, decode
       min_lr=0.01,  # min learning rate.
       lr=0.1,  # learning rate
-      batch_size=4,
+      batch_size=1,
       c_timesteps=600, # context length
       q_timesteps=30, # question length
       min_input_len=2,  # discard context, question < than this words
       hidden_size=200,  # for rnn cell and embedding
-      emb_size=128,  # If 0, don't use embedding
+      emb_size=200,  # If 0, don't use embedding
       max_decode_steps=4,
       maxout_size=32,
       max_grad_norm=2)

@@ -84,8 +84,8 @@ def batch_linear(args, output_size, bias, bias_start=0.0, scope=None, name=None)
     if not bias:
       return res
     with vs.variable_scope(outer_scope) as inner_scope:
-      b_name = "biases_" 
-      if name is not None: b_name += name 
+      b_name = "biases_"
+      if name is not None: b_name += name
       inner_scope.set_partitioner(None)
       biases = vs.get_variable(
           b_name, [output_size, n],
@@ -99,13 +99,11 @@ def _to_3d(tensor):
   m, n = tensor.get_shape()
   return tf.reshape(tensor, [m.value, n.value, 1])
 
-
 def highway_maxout(hidden_size, pool_size):
   """highway maxout network."""
 
-  def compute(u_t, h, u_s, u_e, vs):
+  def compute(u_t, h, u_s, u_e):
     """Computes value of u_t given current u_s and u_e."""
-
     # reshape
     u_t = _to_3d(u_t)
     h = _to_3d(h)
@@ -125,7 +123,6 @@ def highway_maxout(hidden_size, pool_size):
     mm = tf.concat(1, [m_t1, m_t2])
     # final maxout
     res = maxout(batch_linear(mm, pool_size, True, name='mm'), 1, axis=1)
-    vs.reuse_variables()
     return res
 
   return compute

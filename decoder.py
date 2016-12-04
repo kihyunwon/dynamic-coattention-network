@@ -110,12 +110,9 @@ class Decoder(object):
     for _ in range(FLAGS.decode_batches_per_ckpt):
       (batch_context, batch_question, _,
        origin_context, origin_question, _) = data_batcher.next()
-      # position estimates; start from the beginning and the end
-      pos = np.zeros(shape=(2, len(batch_context)))
-      pos[0, :] = 0
-      pos[1, :] = self._params.c_timesteps-1
+      guess = np.zeros((2, model._params.batch_size))
       # model inference
-      (start, end) = model.infer(sess, batch_context, batch_question, pos)
+      (start, end) = model.infer(sess, batch_context, batch_question, guess)
       self._decode_batch(
           batch_context, start, end)
     return True

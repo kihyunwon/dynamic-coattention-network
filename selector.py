@@ -27,29 +27,29 @@ class Model:
     self._num_gpus = num_gpus
     self._cur_gpu = 0
 
-  def train(self, sess, context_batch, question_batch, answer_batch, pos):
+  def train(self, sess, context_batch, question_batch, answer_batch, guesses):
     to_return = [self._train_op, self._summaries, self._loss, self._global_step,
                  self._s, self._e]
     return sess.run(to_return,
                     feed_dict={self._contexts: context_batch,
                                self._questions: question_batch,
                                self._answers: answer_batch,
-                               self._pos: pos})
+                               self._guesses: guesses})
 
-  def eval(self, sess, context_batch, question_batch, answer_batch, pos):
+  def eval(self, sess, context_batch, question_batch, answer_batch, guesses):
     to_return = [self._summaries, self._loss, self._global_step]
     return sess.run(to_return,
                     feed_dict={self._contexts: context_batch,
                                self._questions: question_batch,
                                self._answers: answer_batch,
-                               self._pos: pos})
+                               self._guesses: guesses})
 
-  def infer(self, sess, context_batch, question_batch, pos):
+  def infer(self, sess, context_batch, question_batch, guesses):
     to_return = [self._s, self._e]
     return sess.run(to_return,
                     feed_dict={self._contexts: context_batch,
                                self._questions: question_batch,
-                               self._pos: pos})
+                               self._guesses: guesses})
 
   def _next_device(self):
     """
@@ -77,6 +77,11 @@ class Model:
       return self._next_cpu()
     return '/gpu:%d' % gpu_id
 
+  def _get_cpu(self, cpu_id):
+    if self._num_cpus <= 0 or cpu_id >= self._num_cpus:
+      return self._next_cpu()
+    return '/cpu:%d' % cpu_id
+
   def _add_placeholders(self):
     """Inputs to be fed to the graph."""
     params = self._params
@@ -89,9 +94,9 @@ class Model:
     self._answers = tf.placeholder(tf.int32,
                                    [2, params.batch_size],
                                    name='answers')
-    self._pos = tf.placeholder(tf.int32,
-                               [2, params.batch_size],
-                               name='pos')
+    self._guesses = tf.placeholder(tf.int32,
+                                   [2, params.batch_size],
+                                   name='guesses')
 
   def _build_encoder(self):
     """Builds coattention encoder."""
@@ -99,17 +104,10 @@ class Model:
     params = self._params
     batch_size = params.batch_size
     hidden_size = params.hidden_size
-    state_size = hidden_size//2
     min_timesteps = params.q_timesteps
     max_timesteps = params.c_timesteps
 
-    def lstm_step(lstm, _input, state, scope):
-      in_state = tf.split(1, 2, state)
-      _, out_state = lstm(_input, in_state)
-      scope.reuse_variables()
-      return tf.concat(1, out_state)
-
-    with tf.variable_scope('embedding') as vs, tf.device('/cpu:0'):
+    with tf.variable_scope('embedding') as vs, tf.device(self._next_device()):
       # fixed embedding
       embedding = tf.get_variable(
           'embedding', [self._vsize, params.emb_size], dtype=tf.float32,
@@ -118,43 +116,34 @@ class Model:
       # embed c_inputs and q_inputs.
       fn = lambda x: tf.nn.embedding_lookup(embedding, x)
       c_vector = tf.map_fn(lambda x: fn(x), self._contexts, dtype=tf.float32)
+      c_embedding = tf.transpose(c_vector, perm=[1, 0, 2])
       q_vector = tf.map_fn(lambda x: fn(x), self._questions, dtype=tf.float32)
+      q_embedding = tf.transpose(q_vector, perm=[1, 0, 2])
       # shared lstm encoder
-      lstm_enc = tf.nn.rnn_cell.LSTMCell(state_size)
-      c_state = tf.zeros([batch_size, hidden_size], dtype=tf.float32)
-      q_state = tf.zeros([batch_size, hidden_size], dtype=tf.float32)
+      lstm_enc = tf.nn.rnn_cell.LSTMCell(hidden_size)
 
-      with tf.variable_scope(vs), tf.device(self._next_device()):
-        # compute context embedding
-        fn = lambda state, c: lstm_step(lstm_enc, c, state, vs)
-        c_embedding = tf.scan(lambda state, c: fn(state, c), c_vector, c_state)
-        c_state = c_embedding[-1]
-        c_embedding = tf.transpose(c_embedding, perm=[1, 0, 2])
-        # append sentinel
-        c_sent = tf.zeros([1, hidden_size], dtype=tf.float32)
-        fn = lambda x: tf.concat(0, [x, c_sent])
-        c_embedding = tf.map_fn(lambda x: fn(x), c_embedding, dtype=tf.float32)
+    with tf.variable_scope('c_embedding'), tf.device(self._next_device()):
+      # compute context embedding
+      c, _ = tf.nn.dynamic_rnn(lstm_enc, c_embedding, dtype=tf.float32)
+      # append sentinel
+      fn = lambda x: tf.concat(
+          0, [x, tf.zeros([1, hidden_size], dtype=tf.float32)])
+      c_encoding = tf.map_fn(lambda x: fn(x), c, dtype=tf.float32)
 
-      with tf.variable_scope(vs), tf.device(self._next_device()):
-        # compute question embedding
-        fn = lambda state, q: lstm_step(lstm_enc, q, state, vs)
-        q_embedding = tf.scan(lambda state, q: fn(state, q), q_vector, q_state)
-        q_state = q_embedding[-1]
-        q_embedding = tf.transpose(q_embedding, perm=[1, 2, 0])
-        # append sentinel
-        q_sent = tf.zeros([hidden_size, 1], dtype=tf.float32)
-        fn = lambda x: tf.concat(1, [x, q_sent])
-        q_embedding = tf.map_fn(lambda x: fn(x), q_embedding, dtype=tf.float32)
-
-    with tf.variable_scope('variation'), tf.device(self._next_device()):
+    with tf.variable_scope('q_embedding'), tf.device(self._next_device()):
+      # compute question embedding
+      q, _ = tf.nn.dynamic_rnn(lstm_enc, q_embedding, dtype=tf.float32)
+      # append sentinel
+      fn = lambda x: tf.concat(
+          0, [x, tf.zeros([1, hidden_size], dtype=tf.float32)])
+      q_encoding = tf.map_fn(lambda x: fn(x), q, dtype=tf.float32)
       # allow variation between c_embedding and q_embedding
-      q_embedding = tf.transpose(q_embedding, perm=[0, 2, 1])
-      q_embedding = tf.tanh(batch_linear(q_embedding, min_timesteps+1, True))
-      q_embedding = tf.transpose(q_embedding, perm=[0, 2, 1])
+      q_encoding = tf.tanh(batch_linear(q_encoding, min_timesteps+1, True))
+      q_variation = tf.transpose(q_encoding, perm=[0, 2, 1])
 
     with tf.variable_scope('coattention'), tf.device(self._next_device()):
       # compute affinity matrix, (batch_size, context+1, question+1)
-      L = tf.batch_matmul(c_embedding, q_embedding)
+      L = tf.batch_matmul(c_encoding, q_variation)
       # shape = (batch_size, question+1, context+1)
       L_t = tf.transpose(L, perm=[0, 2, 1])
       # normalize with respect to question
@@ -162,46 +151,23 @@ class Model:
       # normalize with respect to context
       a_c = tf.map_fn(lambda x: tf.nn.softmax(x), L, dtype=tf.float32)
       # summaries with respect to question, (batch_size, question+1, hidden_size)
-      c_q = tf.batch_matmul(a_q, c_embedding)
-      c_q_emb = tf.concat(1, [q_embedding, tf.transpose(c_q, perm=[0, 2 ,1])])
+      c_q = tf.batch_matmul(a_q, c_encoding)
+      c_q_emb = tf.concat(1, [q_variation, tf.transpose(c_q, perm=[0, 2 ,1])])
       # summaries of previous attention with respect to context
       c_d = tf.batch_matmul(c_q_emb, a_c, adj_y=True)
       # final coattention context, (batch_size, context+1, 3*hidden_size)
-      co_att = tf.concat(2, [c_embedding, tf.transpose(c_d, perm=[0, 2, 1])])
-      # reshape
-      co_att = tf.transpose(co_att, perm=[1, 0, 2])
+      co_att = tf.concat(2, [c_encoding, tf.transpose(c_d, perm=[0, 2, 1])])
 
-    def bi_lstm_step(t, co_att, cell, state, vs):
-      att = tf.gather(co_att, t)
-      in_state = tf.split(1, 2, state)
-      _, out_state = cell(att, in_state)
-      vs.reuse_variables()
-      return tf.concat(1, out_state)
-
-    with tf.variable_scope('encoder') as vs, tf.device('/cpu:0'):
+    with tf.variable_scope('encoder'), tf.device(self._next_device()):
       # LSTM for coattention encoding
-      cell_fw = tf.nn.rnn_cell.LSTMCell(state_size)
-      cell_bw = tf.nn.rnn_cell.LSTMCell(state_size)
-      state_fw = tf.zeros([batch_size, hidden_size], dtype=tf.float32)
-      state_bw = tf.zeros([batch_size, hidden_size], dtype=tf.float32)
-
-      # unroll lstm calls to store states for each timestep
-      with tf.variable_scope(vs), tf.device(self._next_device()):
-        # Forward direction
-        forward = list(range(max_timesteps))
-        loop_until = tf.convert_to_tensor(np.array(forward), dtype=np.int32)
-        fn = lambda state, t: bi_lstm_step(t, co_att, cell_fw, state, vs)
-        fw_states = tf.scan(lambda state, t: fn(state, t), loop_until, state_fw)
-        state_fw = fw_states[-1]
-
-      with tf.variable_scope(vs), tf.device(self._next_device()):
-        # Backward direction
-        backword = list(reversed(range(1, max_timesteps+1)))
-        loop_until = tf.convert_to_tensor(np.array(backword), dtype=np.int32)
-        fn = lambda state, t: bi_lstm_step(t, co_att, cell_bw, state, vs)
-        bw_states = tf.scan(lambda state, t: fn(state, t), loop_until, state_bw)
-        state_bw = bw_states[-1]
-        self._U = tf.concat(2, [fw_states, bw_states])
+      cell_fw = tf.nn.rnn_cell.LSTMCell(hidden_size)
+      cell_bw = tf.nn.rnn_cell.LSTMCell(hidden_size)
+      # compute coattention encoding
+      u, _ = tf.nn.bidirectional_dynamic_rnn(
+          cell_fw, cell_bw, co_att,
+          sequence_length=tf.to_int64([max_timesteps]*batch_size),
+          dtype=tf.float32)
+      self._u = tf.concat(2, u)
 
   def _build_decoder(self):
     """Builds dynamic decoder."""
@@ -209,84 +175,82 @@ class Model:
     params = self._params
     batch_size = params.batch_size
     hidden_size = params.hidden_size
-    state_size = hidden_size//2
     maxout_size = params.maxout_size
     max_timesteps = params.c_timesteps
+    max_decode_steps = params.max_decode_steps
 
-    def select(U_m, pos, idx):
-      u_idx = tf.gather(U_m, idx)
+    def select(u, pos, idx):
+      u_idx = tf.gather(u, idx)
       pos_idx = tf.gather(pos, idx)
-      return tf.gather(u_idx, pos_idx)
+      return tf.reshape(tf.gather(u_idx, pos_idx), [-1])
 
-    with tf.variable_scope('decoder') as vs, tf.device('/cpu:0'):
-      # shape = (batch_size, context, 2*hidden_size)
-      U_m = tf.transpose(self._U, perm=[1, 0, 2])
-      # LSTM for decoding
-      lstm_dec = tf.nn.rnn_cell.LSTMCell(state_size)
-      h_state = tf.zeros([batch_size, hidden_size], dtype=tf.float32)
-      
-      # update decoder state
-      with tf.variable_scope(vs), tf.device(self._next_device()):
-        # select estimated position
-        s, e = tf.split(0, 2, self._pos)
-        s = tf.reshape(s, [batch_size])
-        e = tf.reshape(e, [batch_size])
-        batch = list(range(batch_size))
-        loop_until = tf.convert_to_tensor(np.array(batch), dtype=np.int32)
-        fn = lambda idx: select(U_m, s, idx)
+    with tf.variable_scope('selector'):
+      with tf.device(self._next_device()):
+        # LSTM for decoding
+        lstm_dec = tf.nn.rnn_cell.LSTMCell(hidden_size)
+        # init highway fn
+        highway_alpha = highway_maxout(hidden_size, maxout_size)
+        highway_beta = highway_maxout(hidden_size, maxout_size)
+        # reshape self._u, (context, batch_size, 2*hidden_size)
+        U = tf.transpose(self._u[:,:max_timesteps,:], perm=[1, 0, 2])
+        # batch indices
+        loop_until = tf.to_int32(np.array(range(batch_size)))
+        # initial estimated positions
+        s, e = tf.split(0, 2, self._guesses)
+      with tf.device(self._next_device()):
+        fn = lambda idx: select(self._u, s, idx)
         u_s = tf.map_fn(lambda idx: fn(idx), loop_until, dtype=tf.float32)
-        fn = lambda idx: select(U_m, e, idx)
+      with tf.device(self._next_device()):
+        fn = lambda idx: select(self._u, e, idx)
         u_e = tf.map_fn(lambda idx: fn(idx), loop_until, dtype=tf.float32)
-        u_s = tf.reshape(u_s, [batch_size, -1])
-        u_e = tf.reshape(u_e, [batch_size, -1])
+
+    self._s, self._e = [], []
+    self._alpha, self._beta = [], []
+    with tf.variable_scope('decoder') as vs:
+      for step in range(max_decode_steps):
+        if step > 0: vs.reuse_variables()
         # single step lstm
         _input = tf.concat(1, [u_s, u_e])
-        _state = tf.split(1, 2, h_state)
-        _, out_state = lstm_dec(_input, _state)
-        h_state = tf.concat(1, out_state)
+        _, h = tf.nn.rnn(lstm_dec, [_input], dtype=tf.float32)
+        h_state = tf.concat(1, h)
+        with tf.variable_scope('highway_alpha'):
+          # compute start position first
+          fn = lambda u_t: highway_alpha(u_t, h_state, u_s, u_e)
+          alpha = tf.map_fn(lambda u_t: fn(u_t), U, dtype=tf.float32)
+          s = tf.reshape(tf.argmax(alpha, 0), [batch_size])
+          # update start guess
+          fn = lambda idx: select(self._u, s, idx)
+          u_s = tf.map_fn(lambda idx: fn(idx), loop_until, dtype=tf.float32)
+        with tf.variable_scope('highway_beta'):
+          # compute end position next
+          fn = lambda u_t: highway_beta(u_t, h_state, u_s, u_e)
+          beta = tf.map_fn(lambda u_t: fn(u_t), U, dtype=tf.float32)
+          e = tf.reshape(tf.argmax(beta, 0), [batch_size])
+          # update end guess
+          fn = lambda idx: select(self._u, e, idx)
+          u_e = tf.map_fn(lambda idx: fn(idx), loop_until, dtype=tf.float32)
 
-    # highway maxout network
-    with tf.variable_scope('highway'), tf.device('/cpu:0'):
-     # init highway function
-     highway_alpha = highway_maxout(hidden_size, maxout_size)
-     highway_beta = highway_maxout(hidden_size, maxout_size)
-     
-    # compute start position first
-    with tf.variable_scope('highway_alpha') as vs, tf.device(self._next_device()):
-      fn = lambda u_t: highway_alpha(u_t, h_state, u_s, u_e, vs)
-      self._alpha = tf.map_fn(lambda u_t: fn(u_t), self._U, dtype=tf.float32)
-    # update start position
-    with tf.device(self._next_device()):
-      self._s = tf.reshape(tf.argmax(self._alpha, 0), [batch_size])
-      # update u_s
-      fn = lambda idx: select(U_m, self._s, idx)
-      u_s = tf.map_fn(lambda idx: fn(idx), loop_until, dtype=tf.float32)
-    # compute end position next
-    with tf.variable_scope('highway_beta') as vs, tf.device(self._next_device()):
-      fn = lambda u_t: highway_beta(u_t, h_state, u_s, u_e, vs)
-      self._beta = tf.map_fn(lambda u_t: fn(u_t), self._U, dtype=tf.float32)
-    # update end position
-    self._e = tf.reshape(tf.argmax(self._beta, 0), [batch_size])
-
-    # reshape
-    self._alpha = tf.reshape(self._alpha, [batch_size, -1])
-    self._beta = tf.reshape(self._beta, [batch_size, -1])
+        self._s.append(s)
+        self._e.append(e)
+        self._alpha.append(tf.reshape(alpha, [batch_size, -1]))
+        self._beta.append(tf.reshape(beta, [batch_size, -1]))
 
   def _loss_multitask(self, logits_alpha, labels_alpha,
                       logits_beta, labels_beta):
-    """Cumulative loss for start and end position."""
-    loss_alpha = self._loss_shared(logits_alpha, labels_alpha)
-    loss_beta = self._loss_shared(logits_beta, labels_beta)
-    return tf.add_n([loss_alpha, loss_beta], name='loss')
+    """Cumulative loss for start and end positions."""
+    fn = lambda logit, label: self._loss_shared(logit, label)
+    loss_alpha = [fn(alpha, labels_alpha) for alpha in logits_alpha]
+    loss_beta = [fn(beta, labels_beta) for beta in logits_beta]
+    return tf.reduce_sum([loss_alpha, loss_beta], name='loss')
 
   def _loss_shared(self, logits, labels):
     with tf.device(self._next_device()):
       labels = tf.reshape(labels, [self._params.batch_size])
       cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
-          logits, labels, name='cross_entropy_per_step')
+          logits, labels, name='per_step_cross_entropy')
       cross_entropy_mean = tf.reduce_mean(cross_entropy, name='cross_entropy')
-      tf.add_to_collection('losses', cross_entropy_mean)
-      return tf.add_n(tf.get_collection('losses'), name='total_loss')
+      tf.add_to_collection('per_step_losses', cross_entropy_mean)
+      return tf.add_n(tf.get_collection('per_step_losses'), name='per_step_loss')
 
   def _add_train_op(self):
     params = self._params
@@ -303,8 +267,12 @@ class Model:
     tf.scalar_summary('global_norm', global_norm)
     optimizer = tf.train.AdamOptimizer(self._lr_rate)
     tf.scalar_summary('learning rate', self._lr_rate)
-    self._train_op = optimizer.apply_gradients(
-        zip(grads, tvars), global_step=self._global_step, name='train_step')
+    with tf.device(self._next_device()):
+      self._train_op = optimizer.apply_gradients(
+          zip(grads, tvars), global_step=self._global_step, name='train_step')
+    self._summaries = tf.merge_all_summaries()
+
+    return self._train_op, self._loss,
 
   def build_graph(self):
     self._add_placeholders()
